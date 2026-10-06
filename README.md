@@ -139,4 +139,9 @@ networkmanager/                 dispatcher hook + "leave tether0 alone" config
 tools/latency-test.sh           latency benchmark
 docs/how-it-works.md            routing, DNS and compatibility details
 install.sh                      install / uninstall
+LICENSE                         MIT
 ```
+
+## License
+
+[MIT](LICENSE)
