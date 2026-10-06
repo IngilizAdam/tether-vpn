@@ -51,7 +51,7 @@ covers apps you configure one by one, and you want the whole computer
 ## Install
 
 ```bash
-git clone <this repo> && cd tether-vpn
+git clone https://github.com/IngilizAdam/tether-vpn.git && cd tether-vpn
 sudo ./install.sh
 ```
 
