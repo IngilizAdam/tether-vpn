@@ -59,7 +59,8 @@ unzip tun2socks-linux-amd64.zip
 sudo install -m 755 tun2socks-linux-amd64 /usr/local/bin/tun2socks
 ```
 
-**Option B: build with Go.**
+**Option B: build from source with Go.** `go install` downloads tun2socks's
+source code and compiles it on your machine.
 
 ```bash
 sudo dnf install golang        # or: sudo apt install golang
