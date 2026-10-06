@@ -40,13 +40,39 @@ covers apps you configure one by one, and you want the whole computer
 ## Requirements
 
 - Linux with **NetworkManager** and **systemd-resolved** (developed on Fedora 43)
-- **tun2socks** by xjasonlyu (the old `go-tun2socks` by eycorsican, as packaged
-  by some distros, also works). Install with either:
-  - `go install github.com/xjasonlyu/tun2socks/v2@latest` (the installer copies
-    it from `~/go/bin`), or
-  - a release binary from <https://github.com/xjasonlyu/tun2socks/releases>
-    saved as `/usr/local/bin/tun2socks`
+- **tun2socks** by [xjasonlyu](https://github.com/xjasonlyu/tun2socks) (see below)
 - An Android phone running TetherFuseNet
+
+### Installing tun2socks
+
+tun2socks is the program that turns the virtual network card's traffic into
+SOCKS5 connections. Install it **before** running `install.sh`, using either
+option.
+
+**Option A: prebuilt binary (no Go needed).** Pick the zip for your CPU from the
+[releases page](https://github.com/xjasonlyu/tun2socks/releases): `amd64` for
+most PCs, `arm64` for ARM machines like a Raspberry Pi 4/5.
+
+```bash
+curl -LO https://github.com/xjasonlyu/tun2socks/releases/latest/download/tun2socks-linux-amd64.zip
+unzip tun2socks-linux-amd64.zip
+sudo install -m 755 tun2socks-linux-amd64 /usr/local/bin/tun2socks
+```
+
+**Option B: build with Go.**
+
+```bash
+sudo dnf install golang        # or: sudo apt install golang
+go install github.com/xjasonlyu/tun2socks/v2@latest
+```
+
+This puts the binary in `~/go/bin/tun2socks`. `install.sh` copies it to
+`/usr/local/bin`, because systemd (and SELinux on Fedora) won't run programs
+from your home folder.
+
+Check it with `tun2socks --version`. The older `go-tun2socks` by eycorsican,
+which some distros package, also works; tether-vpn detects which one you have.
+If tun2socks is somewhere else, set `TUN2SOCKS=` in the config.
 
 ## Install
 
