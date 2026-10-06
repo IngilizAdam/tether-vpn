@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# tether-vpn: send all of this computer's traffic through the phone's SOCKS5
+# proxy by creating a virtual network card (TUN) that feeds tun2socks.
+# Tailscale, Docker and the local network keep working.
+#
+# Usage:
+#   tether-vpn start | stop | restart | status   (wrappers around the systemd service)
+#   tether-vpn run      Run in the foreground; this is what the service calls
+#   tether-vpn cleanup  Undo every change (safe to run more than once)
+#   tether-vpn uplinks  List the interfaces that could carry the proxy
+#
+# The phone can be reached two ways ("uplinks"):
+#   * Wi-Fi: TetherFuseNet's Wi-Fi Direct network (SSIDS in the config).
+#   * USB:   Android's own USB tethering, which shows up here as an ethernet
+#            card using the rndis_host or cdc_ncm driver. TetherFuseNet's "USB
+#            Tethering" broadcast type binds its proxy to the phone's address
+#            on that link, which is our gateway.
+# Plain USB tethering (without TetherFuseNet) looks exactly the same, so we
+# wait for the proxy port to open before taking over the routes. If the proxy
+# stops answering we put the routes back and wait again.
+#
+# How it works:
+#   * A default route with metric 0 points at the TUN card. It beats
+#     NetworkManager's default route (metric 100) without changing it, and
+#     removing it puts everything back the way it was.
+#   * It has to be a real default (/0) route, not the 0.0.0.0/1 + 128.0.0.0/1
+#     pair: full-tunnel VPNs like WireGuard in NetworkManager or wg-quick add
+#     "lookup main suppress_prefixlength 0" so they can take over the default
+#     route. That skips a /0 route but not /1 routes, which would steal all
+#     traffic from the VPN. With a /0 route, normal traffic goes into the VPN
+#     and the VPN's own (fwmarked) packets still go into this tunnel.
+#   * Tailscale keeps its own routing table (table 52), and a policy rule
+#     checks that table before the main one. Tailnet IPs and the subnets it
+#     routes (e.g. 192.168.1.0/24) keep going to tailscale0. Tailscale's own
+#     encrypted traffic to the internet goes through the tunnel like
+#     everything else.
+#   * The phone and the uplink subnet are more specific than the /1 routes, so
+#     tun2socks can still reach the proxy directly and doesn't loop back
+#     into itself.
+#   * IPv6 is switched off on the uplink while the tunnel is up. USB tethering
+#     can hand out IPv6, and that traffic would otherwise skip the tunnel.
+#   * DNS uses DNS-over-TLS (TCP) through the tunnel. Tailscale's MagicDNS
+#     still handles *.ts.net names.
+set -euo pipefail
+
+CONF=/etc/tether-vpn.conf
+STATE=/run/tether-vpn.state
+SERVICE=tether-vpn.service
+
+# Defaults, overridden by $CONF
+SSIDS=("DIRECT-*")
+USB_TETHER=yes
+USB_DRIVERS=(rndis_host cdc_ncm)
+PROXY_HOST=auto
+PROXY_PORT=8228
+DNS_SERVERS=("1.1.1.1#cloudflare-dns.com" "9.9.9.9#dns.quad9.net")
+TUN_DEV=tether0
+TUN_ADDR=198.18.0.1
+TUN_GW=198.18.0.2
+TUN2SOCKS=${TUN2SOCKS:-}
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+# systemd services get a short PATH, so look in the usual places explicitly
+if [[ -z $TUN2SOCKS ]]; then
+    for c in /usr/local/bin/tun2socks /usr/bin/tun2socks "$(command -v tun2socks || true)"; do
+        [[ -n $c && -x $c ]] && { TUN2SOCKS=$c; break; }
+    done
+fi
+
+log() { echo "tether-vpn: $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+need_root() { [[ $EUID -eq 0 ]] || die "must run as root (try sudo)"; }
+
+ssid_matches() {
+    local pat
+    for pat in "${SSIDS[@]}"; do
+        # shellcheck disable=SC2053
+        [[ $1 == $pat ]] && return 0
+    done
+    return 1
+}
+
+# Is this network card the phone's USB tethering link?
+usb_matches() {
+    [[ $USB_TETHER == yes && -e /sys/class/net/$1/device/driver ]] || return 1
+    local drv d
+    drv=$(basename "$(readlink -f "/sys/class/net/$1/device/driver")")
+    for d in "${USB_DRIVERS[@]}"; do
+        [[ $drv == "$d" ]] && return 0
+    done
+    return 1
+}
+
+# Print connected interfaces that could lead to the phone's proxy, USB first
+# (it's faster and doesn't need Wi-Fi). Format: "<iface> <usb|wifi>"
+uplinks() {
+    local dev type state uuid ssid
+    while IFS=: read -r dev type state; do
+        [[ $state == connected ]] || continue
+        if [[ $type == ethernet ]] && usb_matches "$dev"; then
+            echo "$dev usb"
+        fi
+    done < <(nmcli -t -f DEVICE,TYPE,STATE device)
+    while IFS=: read -r dev type state; do
+        [[ $type == wifi && $state == connected ]] || continue
+        uuid=$(nmcli -g GENERAL.CON-UUID device show "$dev" 2>/dev/null) || continue
+        ssid=$(nmcli -g 802-11-wireless.ssid connection show uuid "$uuid" 2>/dev/null) || continue
+        ssid_matches "$ssid" && echo "$dev wifi"
+    done < <(nmcli -t -f DEVICE,TYPE,STATE device)
+    return 0
+}
+
+gateway_of() {
+    local ifc=$1 gw
+    gw=$(ip -4 route show default dev "$ifc" | awk '/via/ {print $3; exit}')
+    [[ -n $gw ]] || gw=$(nmcli -g IP4.GATEWAY device show "$ifc" 2>/dev/null | head -1)
+    echo "$gw"
+}
+
+port_open() { timeout 3 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
+# There are two programs called "tun2socks" with different options:
+#   xjasonlyu/tun2socks (current, recommended)       -> uses -device/-proxy
+#   eycorsican/go-tun2socks (old Fedora package)     -> uses -tunName/-proxyServer
+tun2socks_flavor() {
+    if "$TUN2SOCKS" -h 2>&1 | grep -q -- '-device'; then echo xjasonlyu; else echo eycorsican; fi
+}
+
+cleanup() {
+    local iface="" proxy="" v6=""
+    if [[ -r $STATE ]]; then
+        # shellcheck source=/dev/null
+        . "$STATE"
+        # STATE_WIFI is what older versions wrote
+        iface=${STATE_IFACE:-${STATE_WIFI:-}}; proxy=${STATE_PROXY:-}; v6=${STATE_V6:-}
+    fi
+    ip route del default dev "$TUN_DEV" metric 0 2>/dev/null || true
+    # Routes used by older versions
+    ip route del 0.0.0.0/1   dev "$TUN_DEV" 2>/dev/null || true
+    ip route del 128.0.0.0/1 dev "$TUN_DEV" 2>/dev/null || true
+    [[ -n $proxy ]] && ip route del "$proxy/32" 2>/dev/null || true
+    resolvectl revert "$TUN_DEV" 2>/dev/null || true
+    if [[ -n $iface ]]; then
+        # Let the uplink's own DNS server answer general lookups again
+        resolvectl default-route "$iface" yes 2>/dev/null || true
+        [[ -n $v6 ]] && echo "$v6" > "/proc/sys/net/ipv6/conf/$iface/disable_ipv6" 2>/dev/null || true
+    fi
+    ip link del "$TUN_DEV" 2>/dev/null || true
+    resolvectl flush-caches 2>/dev/null || true
+    rm -f "$STATE"
+    log "cleaned up"
+}
+
+# Wait until one of the uplinks has a proxy listening. Sets UPLINK, KIND, GW
+# and PROXY. Fails once no possible uplink is left (e.g. cable unplugged).
+wait_for_proxy() {
+    local none=0 seen="" now dev kind gw proxy
+    while :; do
+        now=$(uplinks)
+        if [[ -z $now ]]; then
+            none=$((none + 1))
+            [[ $none -ge 5 ]] && return 1
+        else
+            none=0
+            while read -r dev kind; do
+                gw=$(gateway_of "$dev")
+                if [[ $PROXY_HOST == auto ]]; then
+                    proxy=$gw
+                    [[ -n $proxy || $kind != wifi ]] || proxy=192.168.49.1   # TetherFuseNet Wi-Fi default
+                else
+                    proxy=$PROXY_HOST
+                fi
+                [[ -n $proxy ]] || continue
+                if port_open "$proxy" "$PROXY_PORT"; then
+                    UPLINK=$dev KIND=$kind GW=$gw PROXY=$proxy
+                    return 0
+                fi
+            done <<< "$now"
+            if [[ $now != "$seen" ]]; then
+                log "waiting for the proxy (port $PROXY_PORT) on: $(echo $now)"
+                seen=$now
+            fi
+        fi
+        sleep 3 & wait $!
+    done
+}
+
+start_tunnel() {
+    local flavor i v6=""
+    log "$KIND uplink=$UPLINK gateway=${GW:-none} proxy=$PROXY:$PROXY_PORT"
+
+    [[ -n $TUN2SOCKS && -x $TUN2SOCKS ]] ||
+        die "tun2socks not found; install it to /usr/local/bin/tun2socks (or set TUN2SOCKS= in $CONF)"
+
+    [[ -w /proc/sys/net/ipv6/conf/$UPLINK/disable_ipv6 ]] &&
+        v6=$(< "/proc/sys/net/ipv6/conf/$UPLINK/disable_ipv6")
+    printf 'STATE_IFACE=%q\nSTATE_PROXY=%q\nSTATE_V6=%q\n' "$UPLINK" "$PROXY" "$v6" > "$STATE"
+
+    # Keep the proxy reachable over the uplink even after the tunnel route is
+    # added (this only matters when the proxy isn't on the uplink's subnet).
+    if ip -4 route get "$PROXY" oif "$UPLINK" 2>/dev/null | grep -q " via "; then
+        ip route replace "$PROXY/32" via "$GW" dev "$UPLINK"
+    fi
+
+    flavor=$(tun2socks_flavor)
+    log "using $flavor tun2socks ($TUN2SOCKS)"
+    if [[ $flavor == xjasonlyu ]]; then
+        ip tuntap add mode tun dev "$TUN_DEV"
+        "$TUN2SOCKS" --device "tun://$TUN_DEV" \
+                     --proxy "socks5://$PROXY:$PROXY_PORT" \
+                     --interface "$UPLINK" --loglevel warn &
+    else
+        # The old version creates the device itself
+        "$TUN2SOCKS" -tunName "$TUN_DEV" -tunAddr "$TUN_ADDR" -tunGw "$TUN_GW" \
+                     -tunMask 255.255.255.0 \
+                     -proxyType socks -proxyServer "$PROXY:$PROXY_PORT" \
+                     -loglevel warn &
+    fi
+    PID=$!
+
+    # Wait for the device and any address tun2socks assigns on its own
+    for i in {1..25}; do
+        kill -0 "$PID" 2>/dev/null || die "tun2socks exited early"
+        if ip link show "$TUN_DEV" &>/dev/null; then
+            ip -4 addr show dev "$TUN_DEV" | grep -q inet && break
+            [[ $flavor == xjasonlyu || $i -gt 10 ]] && break
+        fi
+        sleep 0.2
+    done
+    ip link show "$TUN_DEV" &>/dev/null || die "TUN device $TUN_DEV did not appear"
+
+    ip addr replace "$TUN_ADDR/24" dev "$TUN_DEV"
+    ip link set dev "$TUN_DEV" up mtu 1500
+
+    # Send all internet traffic into the tunnel
+    ip route replace default dev "$TUN_DEV" metric 0
+    [[ -n $v6 ]] && echo 1 > "/proc/sys/net/ipv6/conf/$UPLINK/disable_ipv6"
+
+    # DNS: encrypted lookups over TCP through the tunnel. "~." makes this link
+    # handle every domain that no other link (like Tailscale's ts.net) claims.
+    resolvectl dns "$TUN_DEV" "${DNS_SERVERS[@]}"
+    resolvectl dnsovertls "$TUN_DEV" yes
+    resolvectl domain "$TUN_DEV" '~.'
+    resolvectl default-route "$TUN_DEV" yes
+    resolvectl default-route "$UPLINK" no   # the phone's DNS can't be reached in proxy mode
+    resolvectl flush-caches
+
+    log "up: all traffic -> $TUN_DEV -> socks5://$PROXY:$PROXY_PORT via $UPLINK"
+}
+
+# Return when tun2socks dies, the uplink goes away, or the proxy stops
+# answering (e.g. TetherFuseNet was stopped but USB tethering is still on).
+watch_tunnel() {
+    local fails=0
+    while kill -0 "$PID" 2>/dev/null; do
+        sleep 10 & wait $!
+        [[ -e /sys/class/net/$UPLINK ]] || { log "$UPLINK went away"; return; }
+        if port_open "$PROXY" "$PROXY_PORT"; then
+            fails=0
+        else
+            fails=$((fails + 1))
+            [[ $fails -ge 3 ]] && { log "proxy $PROXY:$PROXY_PORT stopped answering"; return; }
+        fi
+    done
+    log "tun2socks exited"
+}
+
+stop_tunnel() {
+    if [[ -n ${PID:-} ]]; then
+        kill "$PID" 2>/dev/null || true
+        wait "$PID" 2>/dev/null || true
+        PID=""
+    fi
+    cleanup
+}
+
+run() {
+    need_root
+    cleanup >/dev/null 2>&1 || true
+    PID=""
+    trap 'stop_tunnel; exit 0' TERM INT
+
+    while :; do
+        if ! wait_for_proxy; then
+            log "no Wi-Fi or USB link to the phone left; exiting"
+            exit 0
+        fi
+        start_tunnel
+        watch_tunnel
+        stop_tunnel
+        log "routes restored; waiting for the proxy again"
+        sleep 2 & wait $!
+    done
+}
+
+case ${1:-} in
+    run)      run ;;
+    cleanup)  need_root; cleanup ;;
+    uplinks)  uplinks ;;
+    start|stop|restart|status) exec systemctl "$1" "$SERVICE" ;;
+    # used by the NetworkManager hook
+    ssid-matches) ssid_matches "${2:-}" ;;
+    usb-matches)  usb_matches "${2:-}" ;;
+    *) echo "usage: $0 {start|stop|restart|status|run|cleanup|uplinks}" >&2; exit 2 ;;
+esac

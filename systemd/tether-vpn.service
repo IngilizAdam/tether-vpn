@@ -1,0 +1,17 @@
+[Unit]
+Description=Route all traffic through the phone's SOCKS proxy (tun2socks)
+After=network-online.target NetworkManager.service systemd-resolved.service
+Wants=network-online.target
+# Give up after repeated failures (e.g. wrong port) instead of looping forever
+StartLimitIntervalSec=120
+StartLimitBurst=6
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/tether-vpn run
+ExecStopPost=/usr/local/sbin/tether-vpn cleanup
+Restart=on-failure
+RestartSec=5
+
+[Install]
+# Not enabled at boot; the NetworkManager hook starts it.

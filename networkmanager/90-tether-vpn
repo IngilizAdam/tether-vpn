@@ -1,0 +1,46 @@
+#!/bin/bash
+# NetworkManager dispatcher hook: start tether-vpn when we join a matching
+# Wi-Fi network or the phone's USB tethering link comes up, and stop it when
+# the link it's using goes away. The service itself waits for the phone's
+# proxy to answer, so plain USB tethering without TetherFuseNet is left alone.
+IFACE=$1 ACTION=$2
+STATE=/run/tether-vpn.state
+[[ $IFACE == tether0 ]] && exit 0
+
+using_iface() { grep -qx "STATE_IFACE=$IFACE" "$STATE" 2>/dev/null; }
+
+case $ACTION in
+    up|dhcp4-change)
+        case $(nmcli -g GENERAL.TYPE device show "$IFACE" 2>/dev/null) in
+            wifi)
+                SSID=$(nmcli -g 802-11-wireless.ssid connection show uuid "$CONNECTION_UUID" 2>/dev/null)
+                if ! /usr/local/sbin/tether-vpn ssid-matches "$SSID"; then
+                    if using_iface; then
+                        logger -t tether-vpn "joined non-proxy Wi-Fi '$SSID'; stopping"
+                        systemctl --no-block stop tether-vpn.service
+                    fi
+                    exit 0
+                fi
+                logger -t tether-vpn "joined '$SSID' on $IFACE" ;;
+            ethernet)
+                /usr/local/sbin/tether-vpn usb-matches "$IFACE" || exit 0
+                logger -t tether-vpn "USB tethering up on $IFACE" ;;
+            *) exit 0 ;;
+        esac
+        systemctl reset-failed tether-vpn.service 2>/dev/null
+        # The phone's address may have changed if the tunnel is using this link
+        if using_iface; then
+            systemctl --no-block restart tether-vpn.service
+        else
+            # No-op if it's already running (or waiting for a proxy)
+            systemctl --no-block start tether-vpn.service
+        fi
+        ;;
+    down|pre-down)
+        if systemctl -q is-active tether-vpn.service && using_iface; then
+            logger -t tether-vpn "$IFACE going down; stopping"
+            systemctl --no-block stop tether-vpn.service
+        fi
+        ;;
+esac
+exit 0

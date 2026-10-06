@@ -1,0 +1,6 @@
+# Editor and OS clutter
+*~
+*.swp
+.DS_Store
+# Local overrides people may keep next to the repo
+*.local.conf
