@@ -23,6 +23,20 @@ apps ──► [WireGuard (optional)] ──► tether0 ──► tun2socks ─�
            Tailscale subnets ──► tailscale0 ──┘ (Tailscale's packets also use tether0)
 ```
 
+## Who this is for
+
+You share your phone's internet through **TetherFuseNet**, whose proxy only
+covers apps you configure one by one, and you want the whole computer
+(including VPNs and Tailscale) to use it automatically.
+
+- It is built and tested for TetherFuseNet. Its defaults (port `8228`, `DIRECT-*`
+  Wi-Fi names, phone address on USB tethering) match TetherFuseNet's.
+- Other Android apps that run a **SOCKS5** proxy on the tethering link should
+  work by changing `PROXY_PORT` and `SSIDS` in the config, but this is untested.
+  HTTP-only proxies are not supported.
+- It does not share internet by itself. If normal USB/Wi-Fi tethering already
+  works for you, you don't need it.
+
 ## Requirements
 
 - Linux with **NetworkManager** and **systemd-resolved** (developed on Fedora 43)
